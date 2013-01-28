@@ -16,9 +16,7 @@
 #include <netinet/in.h>
 #include <fcntl.h>
 #include <arpa/inet.h>
-#ifndef __APPLE__
 #include <malloc.h>
-#endif
 #include <unistd.h>
 
 /* 
@@ -59,6 +57,7 @@ server_accept(int fd)
 	unsigned int len = sizeof(sai);
 
 	new_fd = accept(fd, (struct sockaddr *)&sai, &len);
+
 	if (-1 == new_fd) {
 		perror("accept");
 		return -1;

@@ -38,7 +38,7 @@
 
 #define MAX_DATA_SZ 1024
 #define MAX_CONCURRENCY 4
-
+#define MAX_QUEUE 1024
 /* 
  * This is the function for handling a _single_ request.  Understand
  * what each of the steps in this function do, so that you can handle
@@ -78,95 +78,129 @@ server_single_request(int accept_fd)
  * cas.h) to do lock-free synchronization on a stack or ring buffer.
  */
 
-pthread_t *thd_pool[MAX_CONCURRENCY+1]; // size of the thread pool and a master thread
-pthread_mutex_t job_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
-int job_queue[256]; // can queue 256 jobs in maximum
+/*
+ * Master thread is used for accepting connection
+ * Worker thread is used for process request
+ */
+pthread_t thd_master;
+pthread_t thd_worker[MAX_CONCURRENCY];
 
-void add_job(int job_fd)
+/*
+ * Initialize the mutex and conditional variable
+ */
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+
+/*
+ * Define a single linked list and it's head ptr to store jobs(requests)
+ */
+typedef struct job_node {
+    int fd;
+    struct job_node *next;
+} job;
+
+job *job_queue_head;
+
+void
+job_add(int fd)
 {
-    int i;
-    for(i = 0; i<255; i++)
-    {
-        if(i == 255 && &job_queue[i] != NULL)
-        {
-            printf("job queue is full!\n");
-            break;
-        }
+    job *new_job;
+    new_job = (job*)malloc(sizeof(job));
+    new_job->fd = fd;
+    new_job->next = NULL;
 
-        if(&job_queue[i] == NULL)
-            job_queue[i] = job_fd;
+    if(job_queue_head == NULL)
+    {
+        job_queue_head = new_job;
     }
+    else
+    {
+        while(job_queue_head->next != NULL)
+        {
+            job_queue_head = job_queue_head->next;
+        }
+    }
+
+    job_queue_head->next = new_job;
 
     return;
 }
 
-int
-get_job()
+job*
+job_get()
 {
-    int i, job_fd;
+    job *fetched_job;
 
-    for(i = 0; i < 255; i++)
-    {
-        if(i == 255 && &job_queue[i] == NULL)
-        {
-            printf("no job to do\n");
-
-            int *tmp;
-            tmp = &job_fd;
-            tmp = NULL;
-            job_fd = *tmp;
-            break;
-        }
-
-        if(&job_queue[i] != NULL)
-        {
-            job_fd = job_queue[i];
-        }
-    }
-    return job_fd;
+    fetched_job = job_queue_head;
+    job_queue_head = job_queue_head->next;
+    return fetched_job;
 }
 
-void
-master_thread_routine(int accept_fd)
+void*
+master_thread_routine(int *accept_fd)
 {
     int fd;
+
     while(1)
     {
-        fd = server_accept(accept_fd);
-        pthread_mutex_lock(&job_queue_mutex);
-        add_job(fd);
-        pthread_mutex_unlock(&job_queue_mutex);
+        fd = server_accept(*accept_fd);
+        if(fd != -1)
+        {
+            pthread_mutex_lock(&mutex);
+            job_add(fd);
+            pthread_mutex_unlock(&mutex);
+            printf("master: added a job\n");
+            pthread_cond_signal(&cond);
+            printf("master: signaled others\n");
+        }
     }
+    return NULL;
 }
 
-void 
-worker_thread_routine()
+void*
+worker_thread_routine(void)
 {
     int fd;
-    pthread_mutex_lock(&job_queue_mutex);
-    fd = get_job();
-    pthread_mutex_unlock(&job_queue_mutex);
-    client_process(fd);
+    job *job_to_do;
+
+    while(1)
+    {
+        pthread_mutex_lock(&mutex);
+        pthread_cond_wait(&cond, &mutex);
+        job_to_do = job_get();
+        fd = job_to_do->fd;
+        free(job_to_do);
+        client_process(fd);
+        pthread_mutex_unlock(&mutex);
+
+        printf("thd finished\n");
+    }
+    return NULL;
 }
 
 void
 server_thread_pool_bounded(int accept_fd)
 {
-    pthread_t master_thread, worker_thread[MAX_CONCURRENCY];
+    pthread_t master, worker[MAX_CONCURRENCY];
 
-    pthread_create(&master_thread, NULL, (void*)master_thread_routine, (void*)&accept_fd);
+    pthread_create(&master, NULL, (void*)master_thread_routine, (void*)&accept_fd);
+    printf("master thread created successfully!\n");
 
-	int worker_id;
-    for(worker_id = 0; worker_id < MAX_CONCURRENCY; worker_id++)
+    int i;
+    for(i = 0; i < MAX_CONCURRENCY; i++)
     {
-        pthread_create(&worker_thread[worker_id], NULL, (void*)worker_thread_routine, (void*)&accept_fd);
+        pthread_create(&worker[i], NULL, (void*)worker_thread_routine, NULL);
+        printf("worker thread %d created successfully!\n", i);
     }
+
+    while(1)
+        ;
 
     return;
 }
 
 void
-server_thread_pool_lock_free(/*int accept_fd*/)
+server_thread_pool_lock_free(int accept_fd)
 {
 	return;
 }
@@ -198,7 +232,8 @@ main(int argc, char *argv[])
 
 	port = atoi(argv[1]);
 	accept_fd = server_create(port);
-	if (accept_fd < 0) return -1;
+
+    if (accept_fd < 0) return -1;
 	
 	server_type = atoi(argv[2]);
 
